@@ -1,0 +1,20 @@
+name: Sync fork from upstream
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Sync with upstream
+        run: gh api repos/${{ github.repository }}/merge-upstream --method POST -f branch=main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
