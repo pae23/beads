@@ -15,7 +15,9 @@ import (
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt/migrations"
 	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -51,6 +53,13 @@ type EmbeddedDoltStore struct {
 // errClosed is returned when a method is called after Close.
 var errClosed = errors.New("embeddeddolt: store is closed")
 
+// IsClosed reports whether the store has been closed. Implements
+// storage.LifecycleManager so that callers (e.g., maybeAutoCommit) can
+// skip operations on a closed store without triggering errClosed.
+func (s *EmbeddedDoltStore) IsClosed() bool {
+	return s.closed.Load()
+}
+
 // Option configures optional behavior for New.
 type Option func(*options)
 
@@ -66,17 +75,24 @@ func WithLock(lock Unlocker) Option {
 	return func(o *options) { o.lock = lock }
 }
 
-// New creates an EmbeddedDoltStore using the embedded Dolt engine.
+// newStore creates an EmbeddedDoltStore using the embedded Dolt engine.
 // beadsDir is the .beads/ root; the data directory is derived as <beadsDir>/embeddeddolt/.
 // The database is created automatically if it doesn't exist (initSchema handles this).
 //
 // An exclusive flock is held on the data directory for the store's entire
-// lifetime. If another process already holds the lock, New queues with
+// lifetime. If another process already holds the lock, newStore queues with
 // exponential backoff until the lock becomes available or the context is
 // canceled, instead of panicking during concurrent engine initialization
 // (GH#2571). The lock is released when Close is called, unless a pre-acquired
 // lock was supplied via WithLock (in which case the caller is responsible for it).
-func New(ctx context.Context, beadsDir, database, branch string, opts ...Option) (*EmbeddedDoltStore, error) {
+//
+// Production code should use Open, which routes through a process-scoped cache
+// to prevent same-process deadlocks from the driver's infinite backoff.
+func newStore(ctx context.Context, beadsDir, database, branch string, opts ...Option) (*EmbeddedDoltStore, error) {
+	if database == "" {
+		return nil, fmt.Errorf("embeddeddolt: database name must not be empty (caller should default to %q)", "beads")
+	}
+
 	var o options
 	for _, fn := range opts {
 		fn(&o)
@@ -121,6 +137,17 @@ func New(ctx context.Context, beadsDir, database, branch string, opts ...Option)
 			lock.Unlock()
 		}
 		return nil, fmt.Errorf("embeddeddolt: init schema: %w", err)
+	}
+
+	// Ensure dolt_ignore'd wisp tables exist in the working set.
+	// After a clone or branch switch, these tables are absent because
+	// dolt_ignore prevents them from being committed. Server mode handles
+	// this in newServerMode(); embedded mode must do it here. (GH#3270)
+	if err := s.ensureIgnoredTables(ctx); err != nil {
+		if ownsLock {
+			lock.Unlock()
+		}
+		return nil, fmt.Errorf("embeddeddolt: ensure ignored tables: %w", err)
 	}
 
 	return s, nil
@@ -216,11 +243,21 @@ func (s *EmbeddedDoltStore) withConn(ctx context.Context, commit bool, fn func(t
 // committing them to Dolt history. Uses withRootConn so the database can be
 // created before USE; this avoids running CREATE DATABASE inside withConn,
 // which is not safe for concurrent use in the embedded Dolt engine.
+//
+// After the schema-migration transaction commits, a fresh *sql.DB is opened
+// and used to drive the idempotent compat-migration runner. Mirrors the
+// server-mode open path in dolt/store.go:initSchemaOnDB and repairs
+// pre-existing embedded databases that predate the embedded migration
+// system's full coverage (GH#3412).
 func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
-	return s.withRootConn(ctx, true, func(tx *sql.Tx) error {
+	if err := s.withRootConn(ctx, true, func(tx *sql.Tx) error {
 		if s.database != "" {
 			if !validIdentifier.MatchString(s.database) {
-				return fmt.Errorf("embeddeddolt: invalid database name: %q", s.database)
+				msg := fmt.Sprintf("embeddeddolt: invalid database name: %q", s.database)
+				if strings.ContainsRune(s.database, '-') {
+					msg += "; hyphens are not allowed in embedded mode — replace with underscores in .beads/metadata.json dolt_database field, or run 'bd doctor'"
+				}
+				return errors.New(msg)
 			}
 			if _, err := tx.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+s.database+"`"); err != nil {
 				return fmt.Errorf("embeddeddolt: creating database: %w", err)
@@ -235,7 +272,14 @@ func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
 			}
 		}
 
-		applied, err := migrateUp(ctx, tx)
+		// Ensure dolt_ignore'd tables exist before migrations — some migrations
+		// reference these tables (e.g. 0027 alters wisps, 0030 inserts into
+		// local_metadata). After a clone they don't exist yet.
+		if err := schema.EnsureIgnoredTables(ctx, tx); err != nil {
+			return fmt.Errorf("ensure ignored tables before migration: %w", err)
+		}
+
+		applied, err := schema.MigrateUp(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -252,6 +296,32 @@ func (s *EmbeddedDoltStore) initSchema(ctx context.Context) error {
 			}
 		}
 		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Run idempotent compat migrations on a fresh connection scoped to the
+	// newly-created database and branch. The embedded migration system only
+	// covers databases created from fresh init; pre-existing databases that
+	// predate specific SQL migrations need the defensive compat runner to
+	// repair missing columns and tables (GH#3412).
+	db, cleanup, err := OpenSQL(ctx, s.dataDir, s.database, s.branch)
+	if err != nil {
+		return fmt.Errorf("embeddeddolt: open for compat migrations: %w", err)
+	}
+	defer func() { _ = cleanup() }()
+
+	if err := migrations.RunCompatMigrations(db); err != nil {
+		return fmt.Errorf("embeddeddolt: compat migrations: %w", err)
+	}
+	return nil
+}
+
+// ensureIgnoredTables creates dolt_ignore'd wisp tables if they don't exist.
+// Uses withConn (not withRootConn) because the database is already created.
+func (s *EmbeddedDoltStore) ensureIgnoredTables(ctx context.Context) error {
+	return s.withConn(ctx, false, func(tx *sql.Tx) error {
+		return schema.EnsureIgnoredTables(ctx, tx)
 	})
 }
 
@@ -403,14 +473,30 @@ func (s *EmbeddedDoltStore) GetAllEventsSince(ctx context.Context, since time.Ti
 
 // RunInTransaction is implemented in transaction.go.
 
-// Close marks the store as closed and releases the exclusive flock on the data
-// directory (if the store owns it). Subsequent method calls will return errClosed.
+// Close decrements the reference count if this store was opened via Open (the
+// process-scoped cache). When other references remain, Close is a no-op — the
+// store stays alive for the remaining callers. When the last reference calls
+// Close (or if the store was created directly via New), the underlying
+// resources are released: orphaned git-remote-cache garbage is cleaned up and
+// the exclusive flock on the data directory is released (if the store owns it).
+//
 // It is safe to call multiple times. When the lock was supplied by the caller
 // via WithLock, Close does NOT release it — the caller retains ownership.
 func (s *EmbeddedDoltStore) Close() error {
+	if closeCached(s) {
+		// Other references remain — suppress the real close.
+		return nil
+	}
+	return s.closeUnderlying()
+}
+
+// closeUnderlying performs the actual close: marks the store as closed,
+// cleans up orphaned garbage, and releases the flock.
+func (s *EmbeddedDoltStore) closeUnderlying() error {
 	// Use CompareAndSwap so we only unlock once even if Close is called
 	// multiple times (the Lock.Unlock method panics on double-unlock).
 	if s.closed.CompareAndSwap(false, true) {
+		s.cleanGitRemoteCacheGarbage()
 		if s.lock != nil && s.ownsLock {
 			s.lock.Unlock()
 		}
@@ -739,7 +825,7 @@ func (s *EmbeddedDoltStore) GetCustomTypes(ctx context.Context) ([]string, error
 		if yamlTypes := config.GetCustomTypesFromYAML(); len(yamlTypes) > 0 {
 			return yamlTypes, nil
 		}
-		return nil, nil
+		return nil, err
 	}
 	return result, nil
 }
