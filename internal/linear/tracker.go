@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,9 +42,20 @@ func (t *Tracker) ConfigPrefix() string { return "linear" }
 func (t *Tracker) Init(ctx context.Context, store storage.Storage) error {
 	t.store = store
 
-	apiKey, err := t.getConfig(ctx, "linear.api_key", "LINEAR_API_KEY")
-	if err != nil || apiKey == "" {
-		return fmt.Errorf("Linear API key not configured (set linear.api_key or LINEAR_API_KEY)")
+	// Resolve authentication: OAuth client-credentials takes precedence over API key.
+	oauthClientID, _ := t.getConfig(ctx, "linear.oauth_client_id", "LINEAR_OAUTH_CLIENT_ID")
+	oauthClientSecret, _ := t.getConfig(ctx, "linear.oauth_client_secret", "LINEAR_OAUTH_CLIENT_SECRET")
+	hasOAuth := oauthClientID != "" && oauthClientSecret != ""
+
+	var apiKey string
+	if !hasOAuth {
+		apiKey, _ = t.getConfig(ctx, "linear.api_key", "LINEAR_API_KEY")
+		if apiKey == "" {
+			return fmt.Errorf("Linear authentication not configured\n" +
+				"Options:\n" +
+				"  OAuth (for CI):  export LINEAR_OAUTH_CLIENT_ID=... LINEAR_OAUTH_CLIENT_SECRET=...\n" +
+				"  API key (devs):  export LINEAR_API_KEY=... or bd config set linear.api_key \"YOUR_API_KEY\"")
+		}
 	}
 
 	// Resolve team IDs: use pre-set IDs (from CLI), or fall back to config.
@@ -66,15 +78,34 @@ func (t *Tracker) Init(ctx context.Context, store storage.Storage) error {
 		}
 	}
 
+	// Read optional rate-limit floor (LINEAR_RATE_LIMIT_FLOOR env or linear.rate_limit_floor config).
+	var rateLimitFloor int
+	if floorStr, _ := t.getConfig(ctx, "linear.rate_limit_floor", "LINEAR_RATE_LIMIT_FLOOR"); floorStr != "" {
+		if v, err := strconv.Atoi(strings.TrimSpace(floorStr)); err == nil && v >= 0 {
+			rateLimitFloor = v
+		}
+	}
+
 	// Create per-team clients upfront for O(1) routing.
 	t.clients = make(map[string]*Client, len(t.teamIDs))
 	for _, teamID := range t.teamIDs {
-		client := NewClient(apiKey, teamID)
+		var client *Client
+		if hasOAuth {
+			client = NewOAuthClient(OAuthConfig{
+				ClientID:     oauthClientID,
+				ClientSecret: oauthClientSecret,
+			}, teamID)
+		} else {
+			client = NewClient(apiKey, teamID)
+		}
 		if endpoint != "" {
 			client = client.WithEndpoint(endpoint)
 		}
 		if projectID != "" {
 			client = client.WithProjectID(projectID)
+		}
+		if rateLimitFloor > 0 {
+			client = client.WithRateLimitFloor(rateLimitFloor)
 		}
 		t.clients[teamID] = client
 	}
